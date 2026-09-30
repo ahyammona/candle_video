@@ -830,7 +830,7 @@ impl LtxVideoTransformerBlock {
 
         // ada_values = scale_shift_table[None,None] + temb.reshape(B, T, 6, dim)
         // ada_values = scale_shift_table[None,None] + temb.reshape(B, T, 6, dim)
-        let (b_temb, temb_last) = temb.dims2()?;
+        let (b_temb, t, temb_last) = temb.dims3()?;
         if b_temb != b {
             candle_core::bail!(
                 "temb batch size {} mismatch hidden_states batch size {}",
@@ -843,7 +843,7 @@ impl LtxVideoTransformerBlock {
             candle_core::bail!("temb last dim must be divisible by 6, got {temb_last}");
         }
         let dim = temb_last / 6;
-        let t = 1; // temb is [B, 6*dim], so T=1 effectively
+        //let t = 1; // temb is [B, 6*dim], so T=1 effectively
         let temb_reshaped = temb.reshape((b, t, 6, dim))?;
 
         let table = self
@@ -1039,8 +1039,8 @@ impl LtxVideoTransformer3DModel {
         video_coords: Option<&Tensor>,
         skip_layer_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (_b, _s, _c) = hidden_states.dims3()?;
-
+        //let (_b, _s, _c) = hidden_states.dims3()?;
+        let (b_in, _s, _c) = hidden_states.dims3()?;
         // Convert inputs to model dtype (BF16) if needed
         let model_dtype = self.proj_in.weight().dtype();
         let hidden_states = hidden_states.to_dtype(model_dtype)?;
@@ -1048,10 +1048,21 @@ impl LtxVideoTransformer3DModel {
 
         let hidden_states = self.proj_in.forward(&hidden_states)?;
 
-        let timestep = timestep.flatten_all()?.to_dtype(model_dtype)?; // ensure [B] or flat, in BF16
+        let (tb, tt) = match timestep.dims() {
+            [b, t] if *t > 1 => (*b, *t),
+            _ => (b_in, 1),
+        };
+        let timestep = timestep.flatten_all()?.to_dtype(model_dtype)?;
+        let (temb, embedded_timestep) = self.time_embed.forward(&timestep)?;
+        let d6 = temb.dim(1)?;
+        let d = embedded_timestep.dim(1)?;
+        let temb = temb.reshape((tb, tt, d6))?;
+
+        let embedded_timestep = embedded_timestep.reshape((tb, tt, d))?;
+        //let timestep = timestep.flatten_all()?.to_dtype(model_dtype)?; // ensure [B] or flat, in BF16
 
         // 1. AdaLayerNormSingle (Timesteps -> PixArtEmbed -> Silu -> Linear)
-        let (temb, embedded_timestep) = self.time_embed.forward(&timestep)?; // [B, 6*dim], [B, dim]
+        //let (temb, embedded_timestep) = self.time_embed.forward(&timestep)?; // [B, 6*dim], [B, dim]
 
         let encoder_hidden_states = self.caption_projection.forward(&encoder_hidden_states)?;
 
@@ -1137,7 +1148,8 @@ impl LtxVideoTransformer3DModel {
         // AdaLayerNormSingle returns `emb` which is [B, inner_dim].
         // We need to check dims.
         // If embedded_timestep is [B, D].
-        let emb = embedded_timestep.unsqueeze(1)?.unsqueeze(2)?; // [B, 1, 1, D]
+
+        let emb = embedded_timestep.unsqueeze(2)?; // [B, T, 1, D]
 
         // broadcast add: table + emb
         // [1,1,2,D] + [B,1,1,D] -> [B,1,2,D]
