@@ -1013,7 +1013,11 @@ impl<'a> LtxPipeline<'a> {
                 } else {
                     // No guidance: single forward pass
                     let b = latents.dim(0)?;
-                    let timestep_t = Tensor::full(t as f32, (b,), device)?;
+                    let timestep_t = match &cond_mask {
+                        // t * (1 - mask): 0 for first-frame tokens, t elsewhere -> [B, S]
+                        Some(m) => m.affine(-(t as f64), t as f64)?.squeeze(2)?,
+                        None => Tensor::full(t as f32, (b,), device)?,
+                    };
                     let latents_input = latents.to_dtype(p_emb.dtype())?;
 
                     self.transformer
