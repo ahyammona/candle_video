@@ -89,6 +89,9 @@ struct Args {
     #[arg(long)]
     initial_latents_file: Option<String>,
 
+    #[arg(long)]
+    image: Option<String>,
+
     /// Save final latents to a file for comparison
     #[arg(long)]
     save_final_latents: Option<String>,
@@ -573,6 +576,56 @@ fn main() -> anyhow::Result<()> {
         (vae, transformer)
     };
 
+    // ---- optional first-frame image conditioning ----
+    let image_latents: Option<Tensor> = if let Some(ref img_path) = args.image {
+        use candle_video::models::ltx_video::t2v_pipeline::VaeLtxVideo;
+        println!("  Encoding conditioning image {}...", img_path);
+        let (w, h) = (args.width, args.height);
+        let img = image::open(img_path)
+            .map_err(|e| candle_core::Error::msg(e.to_string()))?
+            .resize_to_fill(w as u32, h as u32, image::imageops::FilterType::Lanczos3)
+            .to_rgb8();
+
+        // [1, 3, 1, H, W], values in [-1, 1]
+        let mut data = vec![0f32; 3 * h * w];
+        for (x, y, px) in img.enumerate_pixels() {
+            for c in 0..3 {
+                data[c * h * w + (y as usize) * w + (x as usize)] = px.0[c] as f32 / 127.5 - 1.0;
+            }
+        }
+        let x = Tensor::from_vec(data, (1, 3, 1, h, w), &device)?.to_dtype(vae.dtype())?;
+
+        let (_, dist) = vae.encode(&x, false, false)?;
+        let z = dist.mode()?.to_dtype(DType::F32)?; // [1, C, 1, h/32, w/32]
+        let c = z.dim(1)?;
+
+        // same normalization the pipeline's denormalize_latents undoes
+        let mean = vae
+            .latents_mean()
+            .reshape((1, c, 1, 1, 1))?
+            .to_device(&device)?
+            .to_dtype(DType::F32)?;
+        let std = vae
+            .latents_std()
+            .reshape((1, c, 1, 1, 1))?
+            .to_device(&device)?
+            .to_dtype(DType::F32)?;
+        let sf = vae.config().scaling_factor as f64;
+        let z = z
+            .broadcast_sub(&mean)?
+            .affine(sf, 0.0)?
+            .broadcast_div(&std)?;
+
+        // pack with patch sizes 1: [1,C,1,h,w] -> [1, h*w, C]
+        let (lh, lw) = (z.dim(3)?, z.dim(4)?);
+        let packed = z
+            .permute((0, 2, 3, 4, 1))?
+            .contiguous()?
+            .reshape((1, lh * lw, c))?;
+        Some(packed)
+    } else {
+        None
+    };
     // Scheduler
     let mut scheduler_config = ltxv_config.scheduler.clone();
     scheduler_config.stochastic_sampling = stochastic_sampling;
@@ -673,7 +726,7 @@ fn main() -> anyhow::Result<()> {
         OutputType::Tensor,
         128,
         Some(ltxv_config.inference.skip_block_list.clone()),
-        None,
+        image_latents,
         &device,
     )?;
 
