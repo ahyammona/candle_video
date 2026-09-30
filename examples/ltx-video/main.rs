@@ -10,9 +10,9 @@ use candle_video::models::ltx_video::{
 };
 use clap::Parser;
 use hf_hub::{Repo, RepoType, api::sync::Api};
-use std::time::Instant;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokenizers::Tokenizer as HfTokenizer;
 
 #[derive(Parser, Debug)]
@@ -219,9 +219,9 @@ fn main() -> anyhow::Result<()> {
             "cuda" => Device::new_cuda(0).unwrap_or(Device::Cpu),
             "wgpu" => Device::new_wgpu(0).unwrap_or(Device::Cpu),
             "vulkan" => Device::new_vulkan(0).unwrap_or(Device::Cpu),
-            other => anyhow::bail!(
-                "unknown device: {other} (expected one of: cpu|cuda|wgpu|vulkan)"
-            ),
+            other => {
+                anyhow::bail!("unknown device: {other} (expected one of: cpu|cuda|wgpu|vulkan)")
+            }
         }
     } else if args.cpu {
         Device::Cpu
@@ -351,7 +351,7 @@ fn main() -> anyhow::Result<()> {
 
             // Determine if we should use unified weights based on version or repository
             let is_098 = args.ltxv_version.contains("0.9.8");
-            
+
             let (transformer, vae) = if is_098 {
                 println!("  Fetching unified weight file (official format)...");
                 let unified = repo.get("ltxv-2b-0.9.8-distilled.safetensors")?;
@@ -673,6 +673,7 @@ fn main() -> anyhow::Result<()> {
         OutputType::Tensor,
         128,
         Some(ltxv_config.inference.skip_block_list.clone()),
+        None,
         &device,
     )?;
 
@@ -747,11 +748,13 @@ fn main() -> anyhow::Result<()> {
         println!("\nDone! Saved GIF to {}", gif_path);
     }
 
-    println!("\n[counter] wgpu_cpu_fallback={} wgpu_host_compute={} vulkan_cpu_fallback={} vulkan_host_compute={}",
+    println!(
+        "\n[counter] wgpu_cpu_fallback={} wgpu_host_compute={} vulkan_cpu_fallback={} vulkan_host_compute={}",
         candle_core::wgpu_cpu_fallback_count(),
         candle_core::wgpu_host_compute_count(),
         candle_core::vulkan_cpu_fallback_count(),
-        candle_core::vulkan_host_compute_count());
+        candle_core::vulkan_host_compute_count()
+    );
     println!("Total runtime: {:?}", t0.elapsed());
 
     Ok(())

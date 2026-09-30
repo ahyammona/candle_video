@@ -649,6 +649,7 @@ impl<'a> LtxPipeline<'a> {
         output_type: OutputType,
         max_sequence_length: usize,
         skip_block_list: Option<Vec<usize>>,
+        image_latents: Option<Tensor>,
         device: &Device,
     ) -> Result<LtxPipelineOutput> {
         self.check_inputs(
@@ -746,6 +747,48 @@ impl<'a> LtxPipeline<'a> {
 
         let video_sequence_length = latent_num_frames * latent_height * latent_width;
 
+        // ---- first-frame image conditioning ----
+        let (cond_mask, cond_init): (Option<Tensor>, Option<Tensor>) =
+            if let Some(img) = image_latents {
+                if self.do_classifier_free_guidance() || self.do_spatio_temporal_guidance() {
+                    candle_core::bail!(
+                        "image conditioning currently supports guidance_scale=1.0 and no STG only"
+                    );
+                }
+                let n_cond = latent_height * latent_width; // tokens in the first latent frame
+                let (b, s, d) = latents.dims3()?;
+                if img.dim(1)? != n_cond {
+                    candle_core::bail!(
+                        "image latents have {} tokens, expected {}",
+                        img.dim(1)?,
+                        n_cond
+                    );
+                }
+                let img = img
+                    .to_device(device)?
+                    .to_dtype(DType::F32)?
+                    .broadcast_as((b, n_cond, d))?
+                    .contiguous()?;
+                let init = Tensor::cat(
+                    &[img, Tensor::zeros((b, s - n_cond, d), DType::F32, device)?],
+                    1,
+                )?;
+                let mask = Tensor::cat(
+                    &[
+                        Tensor::ones((b, n_cond, 1), DType::F32, device)?,
+                        Tensor::zeros((b, s - n_cond, 1), DType::F32, device)?,
+                    ],
+                    1,
+                )?;
+                // start = init * mask + noise * (1 - mask)
+                let keep_noise = mask.affine(-1.0, 1.0)?;
+                latents = latents
+                    .broadcast_mul(&keep_noise)?
+                    .broadcast_add(&init.broadcast_mul(&mask)?)?;
+                (Some(mask), Some(init))
+            } else {
+                (None, None)
+            };
         // Check if sigmas were provided before moving
         let has_custom_sigmas = sigmas_provided.is_some();
 
@@ -870,8 +913,13 @@ impl<'a> LtxPipeline<'a> {
             // We use Sequential CFG style to save memory, running passes one by one.
             let noise_pred =
                 if self.do_classifier_free_guidance() || self.do_spatio_temporal_guidance() {
+                    // let b = latents.dim(0)?;
+                    // let timestep_t = Tensor::full(t as f32, (b,), device)?;
                     let b = latents.dim(0)?;
-                    let timestep_t = Tensor::full(t as f32, (b,), device)?;
+                    let timestep_t = match &cond_mask {
+                        Some(m) => m.affine(-(t as f64), t as f64)?.squeeze(2)?,
+                        None => Tensor::full(t as f32, (b,), device)?,
+                    };
                     let latents_input = latents.to_dtype(dtype)?;
 
                     // 1. Unconditional pass (if CFG active)
@@ -985,6 +1033,13 @@ impl<'a> LtxPipeline<'a> {
                 };
 
             latents = self.scheduler.step(&noise_pred, t, &latents)?;
+
+            if let (Some(m), Some(init)) = (&cond_mask, &cond_init) {
+                let keep = m.affine(-1.0, 1.0)?;
+                latents = latents
+                    .broadcast_mul(&keep)?
+                    .broadcast_add(&init.broadcast_mul(m)?)?
+            }
 
             if i == ts.len() - 1
                 || ((i + 1) > num_warmup_steps && (i + 1) % self.scheduler.order() == 0)
